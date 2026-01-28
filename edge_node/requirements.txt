@@ -1,0 +1,4 @@
+opencv-python
+numpy
+requests
+# hobot_dnn # Pre-installed on RDK X5 / Horizon Sunrise systems
