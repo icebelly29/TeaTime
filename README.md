@@ -2,6 +2,8 @@
 
 A context-aware AIoT system designed to detect the arrival of tea or coffee service staff in an office environment and send real-time alerts to a local display.
 
+<img src="https://github.com/user-attachments/assets/106e16a0-7f0e-4d40-ba3b-7dba7ee0bef5" alt="Sample Image" style="width:35%; height:auto;">
+
 ## System Architecture
 
 The system operates entirely on the local network (no cloud) and consists of two main nodes:
