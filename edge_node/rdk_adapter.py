@@ -3,12 +3,18 @@ import numpy as np
 import config
 import time
 
-# Try importing RDK-specific libraries
 try:
     from hobot_dnn import pyeasy_dnn
     RDK_AVAILABLE = True
 except ImportError:
     RDK_AVAILABLE = False
+
+# Import the post-processor helper
+try:
+    from fcos_lib import FcosPostProcessor
+except ImportError:
+    print("[WARN] fcos_lib not found. RDK post-processing will not work.")
+    FcosPostProcessor = None
 
 class RDKDetector:
     def __init__(self, model_path=config.RDK_MODEL_PATH):
@@ -19,12 +25,28 @@ class RDKDetector:
         self.models = pyeasy_dnn.load(model_path)
         self.h = config.RDK_MODEL_HEIGHT
         self.w = config.RDK_MODEL_WIDTH
+        
+        # Initialize post-processor
+        if FcosPostProcessor:
+            # We assume model 0 is the detector
+            # Note: We initialize with default/config sizes.
+            # Ideally, these should match the camera resolution for correct scaling,
+            # but FcosPostProcessor handles scaling internally via "ori_w/h" in its struct.
+            # We'll pass 1920x1080 as a default "original" size, or update it per frame if needed.
+            # For now, let's assume a standard 640x480 capture from main.py, 
+            # but FCOS usually expects 1920x1080 context for its "ori" params if coming from HDMI sample.
+            # We will act as if the "original" frame is what we get in detect_person.
+            self.postprocessor = FcosPostProcessor(
+                self.models[0].outputs, 
+                input_w=self.w, 
+                input_h=self.h,
+                ori_w=640, # Default, will be updated/ignored by drawing logic if we handled it there
+                ori_h=480
+            )
+        else:
+            self.postprocessor = None
 
     def bgr2nv12_opencv(self, image):
-        """
-        Converts BGR image to NV12 (YUV420 semi-planar) using OpenCV.
-        Required for RDK X5 BPU input.
-        """
         height, width = image.shape[0], image.shape[1]
         area = height * width
         yuv420p = cv2.cvtColor(image, cv2.COLOR_BGR2YUV_I420).reshape((area * 3 // 2,))
@@ -37,85 +59,71 @@ class RDKDetector:
         return nv12
 
     def preprocess(self, img):
-        """
-        Resize and convert to NV12.
-        """
-        # Resize to model input size
         resized = cv2.resize(img, (self.w, self.h))
-        # Convert to NV12
         nv12_data = self.bgr2nv12_opencv(resized)
         return nv12_data
 
-    def postprocess(self, outputs, src_h, src_w):
-        """
-        Parse FCOS/YOLO output from BPU.
-        This is a SIMPLIFIED parser assuming standard FCOS 3-output structure.
-        Real implementations might need adjustment based on specific model version.
-        
-        Returns: list of ((x1, y1, x2, y2), confidence)
-        """
-        # NOTE: This part often requires specific logic per model version.
-        # Typically outputs[0] = box regression, outputs[1] = classification, etc.
-        # For this demo, we assume the outputs are iterable and contain accessible tensors.
-        
-        preds = []
-        
-        # Accessing the output tensors (assuming numpy-like interface from pyeasy_dnn)
-        # If this fails, the user needs to check the 'postprocess' example in RDK Model Zoo
-        try:
-            # Example logic: just taking the first valid output for demonstration
-            # In reality, you need to decode strides and anchors here.
-            # Since that code is 100+ lines, we will implement a basic "Pass-through"
-            # or ask the user to provide the parsed boxes if using a complex model.
-            
-            # Placeholder for actual decoding logic
-            pass 
-        except Exception as e:
-            print(f"[RDK] Post-processing error: {e}")
-
-        # --- MOCK IMPLEMENTATION FOR DEMO IF REAL PARSING IS MISSING ---
-        # Since we can't blindly decode unknown binary model outputs without the 
-        # specific post-process script usually found in /app/py_dev/ params:
-        # We will return an empty list and print a warning if this method is called 
-        # without the specific decoding logic being pasted in.
-        
-        # To make this useful, we assume the user might replace this method
-        # with the one from `fcos_post_process.py` in their RDK examples.
-        return preds
-
     def detect_person(self, frame):
         """
-        Main detection interface compatible with TeaDetector.
+        Detects persons in the frame using RDK BPU.
+        Returns: list of ((x1, y1, x2, y2), confidence)
         """
+        if not self.postprocessor:
+            return []
+
         h, w = frame.shape[:2]
+        
+        # Update original dimensions in post-processor info struct for correct scaling
+        self.postprocessor.info.ori_height = h
+        self.postprocessor.info.ori_width = w
+        
         nv12_data = self.preprocess(frame)
         
         t0 = time.time()
         outputs = self.models[0].forward(nv12_data)
-        # print(f"[RDK] Inference time: {(time.time()-t0)*1000:.2f}ms")
+        # print(f"[RDK] Inference: {(time.time()-t0)*1000:.1f}ms")
         
-        # ---------------------------------------------------------
-        # CRITICAL: RDK X5 "Boxs" SDK usually provides a C++ post-process
-        # or a Python utility. If you are using the standard 'mono2d_body' model,
-        # you need the corresponding 'postprocess' function.
-        # ---------------------------------------------------------
+        results = self.postprocessor.process(outputs)
         
-        # For the purpose of this script, we assume a `postprocess` utility 
-        # is available or we return a placeholder. 
-        # IF YOU HAVE THE "fcos_post_process.py" from RDK Model Zoo, import it here.
-        
-        # detections = custom_fcos_decoder(outputs, ... params ...)
-        
-        # FALLBACK: If we can't decode, we warn.
-        # In a real deployment, you would paste the 'postprocess' code here.
-        
-        print("[RDK] Warning: Raw BPU output received. Post-processing logic required.")
-        return [] # Returning empty to prevent crash, user needs to add decoder.
-    
+        parsed_detections = []
+        for det in results:
+            # det is {'bbox': [x1, y1, x2, y2], 'score': float, 'id': int, 'name': str}
+            # Class 'person' is usually 'person' or id 0
+            if det.get('name') == 'person':
+                bbox = det['bbox']
+                score = det['score']
+                
+                # Scale bbox to original frame size
+                # The FCOS post-process lib might return coords relative to model input or original?
+                # Based on 'draw_bboxs' in the sample, it returns coords that need scaling.
+                # "coor[0] = int(coor[0] * scale_x)" where scale_x = target_w / ori_w
+                # Wait, the sample code sets 'ori_width' in the struct to display res.
+                # If we set ori_width in struct to 'w' (frame width), maybe it returns scaled coords?
+                # Let's check logic:
+                # The sample code passes 1920x1080 as ori.
+                # The sample code MANUALY scales the output bbox by (target_w / ori_w).
+                # This implies the library returns coordinates in the range of [0, ori_w].
+                # So if we set info.ori_width = w, the output should be [0, w].
+                
+                # However, to be safe, we will just take the raw output and clamp/round.
+                # Let's assume the library respects the 'ori' dimensions we set.
+                
+                x1, y1, x2, y2 = bbox
+                
+                # Ensure they are integers
+                x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+                
+                # Clamp
+                x1 = max(0, min(w, x1))
+                y1 = max(0, min(h, y1))
+                x2 = max(0, min(w, x2))
+                y2 = max(0, min(h, y2))
+                
+                parsed_detections.append(((x1, y1, x2, y2), score))
+                
+        return parsed_detections
+
     def check_uniform_color(self, frame, bbox):
-        # Reuse the logic from the original detector (it's pure OpenCV/NumPy)
-        # We can implement it here or import it.
-        # Simple copy-paste of logic for standalone nature:
         (startX, startY, endX, endY) = bbox
         height = endY - startY
         upper_body_start_y = startY + int(height * 0.1)

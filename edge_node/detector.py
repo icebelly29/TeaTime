@@ -3,50 +3,13 @@ import numpy as np
 import config
 
 class TeaDetector:
-    def __init__(self, prototxt_path="MobileNetSSD_deploy.prototxt", model_path="MobileNetSSD_deploy.caffemodel"):
+    def __init__(self):
         """
-        Initializes the detector with a pre-trained MobileNet SSD model.
+        Initializes the detector (no model loading needed as detection comes from ROS topic).
         """
-        self.net = cv2.dnn.readNetFromCaffe(prototxt_path, model_path)
-        
-        # Class index for 'person' in MobileNet SSD is 15
-        self.PERSON_CLASS_ID = 15
-
-    def detect_person(self, frame):
-        """
-        Detects persons in the frame.
-        Returns a list of bounding boxes (startX, startY, endX, endY) and confidence scores.
-        """
-        (h, w) = frame.shape[:2]
-        blob = cv2.dnn.blobFromImage(cv2.resize(frame, (300, 300)), 0.007843,
-            (300, 300), 127.5)
-
-        self.net.setInput(blob)
-        detections = self.net.forward()
-
-        results = []
-
-        for i in range(detections.shape[2]):
-            confidence = detections[0, 0, i, 2]
-
-            # Filter out weak detections
-            if confidence > config.CONFIDENCE_THRESHOLD:
-                idx = int(detections[0, 0, i, 1])
-
-                # Check if the detected object is a person
-                if idx == self.PERSON_CLASS_ID:
-                    box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
-                    (startX, startY, endX, endY) = box.astype("int")
-                    
-                    # Ensure bounding box is within frame dimensions
-                    startX = max(0, startX)
-                    startY = max(0, startY)
-                    endX = min(w, endX)
-                    endY = min(h, endY)
-
-                    results.append(((startX, startY, endX, endY), confidence))
-
-        return results
+        # The MobileNetSSD model loading is removed as it's no longer used for person detection.
+        # This class now primarily serves the check_uniform_color functionality.
+        pass
 
     def check_uniform_color(self, frame, bbox):
         """
@@ -58,16 +21,25 @@ class TeaDetector:
         # Calculate height of the person
         height = endY - startY
         
-        # Focus on the upper body (e.g., top 50% of the detection)
-        # We start slightly below the top to avoid head/hair, say top 10% to 60%
+        # Focus on the upper body (e.g., top 10% to 60% of the detection)
         upper_body_start_y = startY + int(height * 0.1)
         upper_body_end_y = startY + int(height * 0.6)
         
-        # Crop the upper body region
+        # Crop the upper body region, ensuring coordinates are within frame bounds
+        # Also ensure start <= end for valid slicing
+        upper_body_start_y = max(0, min(upper_body_start_y, frame.shape[0]))
+        upper_body_end_y = max(0, min(upper_body_end_y, frame.shape[0]))
+        startX = max(0, min(startX, frame.shape[1]))
+        endX = max(0, min(endX, frame.shape[1]))
+
+        if upper_body_start_y >= upper_body_end_y or startX >= endX:
+            # Invalid ROI, cannot process
+            return False, 0.0, None
+
         roi = frame[upper_body_start_y:upper_body_end_y, startX:endX]
         
         if roi.size == 0:
-            return False, 0.0
+            return False, 0.0, None
 
         # Convert to HSV
         hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
@@ -86,4 +58,4 @@ class TeaDetector:
         
         is_detected = percentage >= config.UNIFORM_PIXEL_PERCENTAGE_THRESHOLD
         
-        return is_detected, percentage
+        return is_detected, percentage, mask
